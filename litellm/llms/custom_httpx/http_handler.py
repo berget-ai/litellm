@@ -605,17 +605,22 @@ class AsyncHTTPHandler:
         client_alias: str | None = None,  # name for client in logs
         ssl_verify: VerifyTypes | None = None,
         shared_session: Optional["ClientSession"] = None,
+        client: httpx.AsyncClient | None = None,
     ):
         self.timeout = timeout
         self.event_hooks = event_hooks
         self.ssl_verify = ssl_verify
         self.shared_session = shared_session
-        self._owns_client = True
-        self._client = self.create_client(
-            timeout=timeout,
-            event_hooks=event_hooks,
-            ssl_verify=ssl_verify,
-            shared_session=shared_session,
+        self._owns_client = client is None
+        self._client = (
+            client
+            if client is not None
+            else self.create_client(
+                timeout=timeout,
+                event_hooks=event_hooks,
+                ssl_verify=ssl_verify,
+                shared_session=shared_session,
+            )
         )
         self.client_alias = client_alias
 
@@ -811,6 +816,8 @@ class AsyncHTTPHandler:
             response.raise_for_status()
             return response
         except (httpx.RemoteProtocolError, httpx.ConnectError):
+            if not self._owns_client:
+                raise
             # Retry the request with a new session if there is a connection error
             new_client: Final = self.create_client(timeout=timeout, event_hooks=self.event_hooks)
             try:

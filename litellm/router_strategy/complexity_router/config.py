@@ -1254,6 +1254,19 @@ class ComplexityRouterConfig(BaseModel):
         ),
     )
 
+    context_window_compaction_model: str | None = Field(
+        default=None,
+        min_length=1,
+        pattern=r"\S",
+        description=(
+            "Ordinary Router model group used to summarize older history when an asynchronous "
+            "Chat Completions, Responses, or Messages request exceeds its selected deployment's "
+            "input budget. Compaction preserves that deployment and takes precedence over context "
+            "window escalation. Summaries are lossy and incur additional billable calls under the "
+            "caller's normal model access and limits. Nested Auto Routers are not supported. "
+            "Omit or set null to keep existing routing behavior."
+        ),
+    )
     enable_context_window_escalation: bool = Field(
         default=True,
         description=(
@@ -1265,7 +1278,8 @@ class ComplexityRouterConfig(BaseModel):
             "moves to the lowest configured tier with a model whose declared window fits; when "
             "only some of the tier's models fit, the pick is restricted to those and the tier "
             "keeps the request. Models with no resolvable window are never escalated away from "
-            "and never escalated onto. Set false to dispatch on complexity alone, as before."
+            "and never escalated onto. Set false to dispatch on complexity alone, as before. "
+            "Ignored when context_window_compaction_model is configured."
         ),
     )
     context_window_escalation_buffer: float = Field(

@@ -362,6 +362,55 @@ response = litellm.completion(
 
 ## Special Behaviors
 
+### Compact history on context overflow
+
+Set `context_window_compaction_model` to an ordinary Router model group that supports Chat
+Completions. It receives older conversation history to summarize, so choose a recipient appropriate
+for that data. The group must already exist in `model_list`; another Auto Router cannot serve as
+the compaction model
+
+```yaml
+model_list:
+  - model_name: smart-router
+    litellm_params:
+      model: auto_router/complexity_router
+      complexity_router_config:
+        tiers:
+          SIMPLE: small-model
+          COMPLEX: large-model
+        context_window_compaction_model: conversation-summary
+```
+
+Here `small-model`, `large-model`, and `conversation-summary` refer to your configured model groups.
+Omitting the setting or using `null` keeps existing behavior. Empty and whitespace-only names are
+rejected. When configured, compaction takes precedence over `enable_context_window_escalation`
+
+Compaction applies to asynchronous Chat Completions, Responses, and Messages requests, including
+streaming requests. It preserves the selected concrete deployment, including a session pin, and
+checks its input budget before dispatch. Requests that already fit use their original history.
+On overflow, completed older text and tool exchanges can become a labeled, untrusted summary.
+The newest actual user turn and everything after it, system and developer instructions, and
+request-level tool definitions remain verbatim. Synchronous SDK calls and raw passthrough are
+outside this feature. The legacy `usage-based-routing` selector delegates to synchronous routing
+and explicitly rejects configured compaction, even through an async API. Use an async-native
+selector such as `simple-shuffle` or `usage-based-routing-v2`
+
+Compaction is lossy: a summary can omit details. It adds latency and one or more separately billable
+model calls. There is no exact upfront cost promise and no guarantee it costs less than choosing a
+larger model. The caller needs normal access to the configured summary recipient, and the summary
+calls remain subject to normal budgets, rate limits, deployment restrictions, and spend accounting
+
+The input budget reserves the requested output limit and a safety margin. Compaction allows at most
+16 summary calls within 120 seconds, further bounded by the request timeout. Summary output is capped
+at 8,192 tokens or the smallest configured summary deployment's output limit. Retries can reuse a
+summary within the same request. A delayed streaming fallback can reuse that summary or fitting
+original history, but cannot start new proxy summary calls after the initial response scope closes
+
+If the preserved content cannot fit, or supported history cannot be recovered, the request fails
+with an explicit context error. This includes unavailable `previous_response_id` history, opaque
+references, unsupported media in the older history, and unmatched tool exchanges. Failed, empty,
+or still-oversized summaries also produce an explicit error rather than silently truncating history
+
 ### Modality-based capability routing
 
 The classifier reads text alone, so a request carrying an image can classify cheap and land on a

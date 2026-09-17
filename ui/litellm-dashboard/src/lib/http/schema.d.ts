@@ -35906,6 +35906,11 @@ export interface components {
              */
             code_keywords?: string[] | null;
             /**
+             * Context Window Compaction Model
+             * @description Ordinary Router model group used to summarize older history when an asynchronous Chat Completions, Responses, or Messages request exceeds its selected deployment's input budget. Compaction preserves that deployment and takes precedence over context window escalation. Summaries are lossy and incur additional billable calls under the caller's normal model access and limits. Nested Auto Routers are not supported. Omit or set null to keep existing routing behavior.
+             */
+            context_window_compaction_model?: string | null;
+            /**
              * Context Window Escalation Buffer
              * @description Fraction of a model's declared context window the estimated prompt must fit within. The token count is an estimate, so fitting against the full window would dispatch prompts that the provider's own tokenizer then rejects; 0.95 leaves room for that drift plus the response tokens.
              * @default 0.95
@@ -35947,7 +35952,7 @@ export interface components {
             embedding_model?: string | null;
             /**
              * Enable Context Window Escalation
-             * @description Escalate a request off a tier whose models provably cannot hold its prompt, before dispatch. The classifier scores complexity and never prompt size, so a long agentic session whose newest ask is trivial lands on a small-window tier and the provider rejects it with a context-window 400 that nothing retries. When every model of the decided tier has a declared window smaller than the estimated prompt, the request moves to the lowest configured tier with a model whose declared window fits; when only some of the tier's models fit, the pick is restricted to those and the tier keeps the request. Models with no resolvable window are never escalated away from and never escalated onto. Set false to dispatch on complexity alone, as before.
+             * @description Escalate a request off a tier whose models provably cannot hold its prompt, before dispatch. The classifier scores complexity and never prompt size, so a long agentic session whose newest ask is trivial lands on a small-window tier and the provider rejects it with a context-window 400 that nothing retries. When every model of the decided tier has a declared window smaller than the estimated prompt, the request moves to the lowest configured tier with a model whose declared window fits; when only some of the tier's models fit, the pick is restricted to those and the tier keeps the request. Models with no resolvable window are never escalated away from and never escalated onto. Set false to dispatch on complexity alone, as before. Ignored when context_window_compaction_model is configured.
              * @default true
              */
             enable_context_window_escalation: boolean;

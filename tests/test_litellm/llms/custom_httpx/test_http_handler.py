@@ -26,6 +26,37 @@ from litellm.llms.custom_httpx.http_handler import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.RemoteProtocolError])
+async def test_injected_async_client_never_retries_through_network(error_type):
+    attempts = asyncio.Queue()
+
+    async def before_send(request: httpx.Request) -> None:
+        attempts.put_nowait(request.url)
+        assert attempts.qsize() == 1, "injected transport was replayed through another client"
+
+    async def reject(request: httpx.Request) -> httpx.Response:
+        raise error_type("in-process failure", request=request)
+
+    hooks = {"request": [before_send]}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reject), event_hooks=hooks) as client:
+        handler = AsyncHTTPHandler(client=client, event_hooks=hooks)
+        with pytest.raises(error_type):
+            await handler.post("http://in-process.test/v1/chat/completions", json={"model": "summary"})
+        await handler.close()
+        assert not client.is_closed
+        assert attempts.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_injected_async_client_is_not_recreated_after_caller_closes_it():
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+    handler = AsyncHTTPHandler(client=client)
+    await client.aclose()
+    with pytest.raises(RuntimeError, match="closed"):
+        await handler.post("http://in-process.test/v1/chat/completions")
+
+
+@pytest.mark.asyncio
 async def test_async_post_streaming_status_error_should_not_wait_forever_for_body(
     monkeypatch,
 ):

@@ -13454,6 +13454,28 @@ def _tier_config(**overrides) -> Dict:
     return {"tiers": {"SIMPLE": "small-model", "COMPLEX": "big-model"}, **overrides}
 
 
+class TestContextWindowCompactionConfig:
+    @pytest.mark.parametrize("value", ["", " ", "\t\n", "\u2003", 17, {"model": "summary-model"}])
+    def test_rejects_blank_or_non_string_model_groups(self, value: object) -> None:
+        with pytest.raises(ValidationError, match="context_window_compaction_model"):
+            ComplexityRouterConfig.model_validate(
+                {"tiers": {"SIMPLE": "small-model"}, "context_window_compaction_model": value}
+            )
+
+    @pytest.mark.parametrize("compaction_model", [None, "summary-model"])
+    def test_optional_model_group_round_trips_without_changing_defaults(self, compaction_model: str | None) -> None:
+        baseline: Final = ComplexityRouterConfig(tiers={"SIMPLE": "small-model"})
+        configured: Final = ComplexityRouterConfig(
+            tiers={"SIMPLE": "small-model"}, context_window_compaction_model=compaction_model
+        )
+        restored: Final = ComplexityRouterConfig.model_validate_json(configured.model_dump_json())
+        assert baseline.context_window_compaction_model is None
+        assert restored.context_window_compaction_model == compaction_model
+        assert restored.model_dump(exclude={"context_window_compaction_model"}) == baseline.model_dump(
+            exclude={"context_window_compaction_model"}
+        )
+
+
 class TestContextWindowEscalation:
     """A tier decided on complexity alone must still hold the prompt, or the provider 400s.
 
@@ -13620,6 +13642,66 @@ class TestContextWindowEscalation:
         assert result is not None
         assert result.model == "small-model"
         assert "context_escalated" not in result.routing_decision
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("compaction_model", [None, "summary-model"])
+    @pytest.mark.parametrize("session_affinity", [False, True])
+    async def test_compaction_keeps_the_selected_group_on_overflow(
+        self, compaction_model: str | None, session_affinity: bool
+    ) -> None:
+        router: Final = ComplexityRouter(
+            model_name="test-router",
+            litellm_router_instance=_windowed_router(_SMALL, _BIG),
+            complexity_router_config={
+                "tiers": {"SIMPLE": "small-model", "COMPLEX": "big-model"},
+                "session_affinity": session_affinity,
+                "context_window_compaction_model": compaction_model,
+            },
+        )
+        request_kwargs: Final = {"metadata": {"session_id": "compaction-session"}}
+        original: Final = await router.async_pre_routing_hook(
+            model="test-router", request_kwargs=request_kwargs, messages=[{"role": "user", "content": "ok continue"}]
+        )
+        oversized: Final = await router.async_pre_routing_hook(
+            model="test-router", request_kwargs=request_kwargs, messages=_OVERSIZED_TURNS
+        )
+
+        assert original is not None and original.model == "small-model"
+        assert oversized is not None
+        assert oversized.model == (original.model if compaction_model else "big-model")
+        assert oversized.routing_decision.get("context_escalated", False) is (compaction_model is None)
+        if session_affinity:
+            assert oversized.routing_decision["cause"] == "session_affinity_pin"
+
+    @pytest.mark.asyncio
+    async def test_compaction_skips_context_filtering_and_precomputed_placement(self) -> None:
+        catalog: Final = _windowed_router(_SMALL, _BIG)
+        ordinary: Final = ComplexityRouter(
+            model_name="ordinary-router",
+            litellm_router_instance=catalog,
+            complexity_router_config={"tiers": {"SIMPLE": "small-model", "COMPLEX": "big-model"}},
+        )
+        compacting: Final = ComplexityRouter(
+            model_name="compacting-router",
+            litellm_router_instance=catalog,
+            complexity_router_config={
+                "tiers": {"SIMPLE": "small-model", "COMPLEX": "big-model"},
+                "context_window_compaction_model": "summary-model",
+            },
+        )
+        ordinary_fit: Final = await ordinary._request_context_fit(_OVERSIZED_TURNS, {})
+        compacting_fit: Final = await compacting._request_context_fit(_OVERSIZED_TURNS, {})
+        ordinary_placement: Final = await ordinary._context_window_placement(
+            ComplexityTier.SIMPLE, _OVERSIZED_TURNS, {}, context_fit=ordinary_fit
+        )
+        compacting_placement: Final = await compacting._context_window_placement(
+            ComplexityTier.SIMPLE, _OVERSIZED_TURNS, {}, context_fit=ordinary_fit
+        )
+
+        assert not ordinary_fit.accepts("small-model")
+        assert compacting_fit.accepts("small-model")
+        assert ordinary_placement is not None and ordinary_placement.tier == ComplexityTier.COMPLEX
+        assert compacting_placement is None
 
     @pytest.mark.asyncio
     async def test_out_of_band_system_and_tools_count_against_the_window(self):

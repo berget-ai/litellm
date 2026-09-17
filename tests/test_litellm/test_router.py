@@ -6,8 +6,11 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import datetime, timedelta
+from queue import SimpleQueue
+from types import MappingProxyType
 from types import SimpleNamespace
 from typing import Final, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,7 +19,8 @@ import httpx
 import openai
 import pytest
 import respx
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
+from pydantic import TypeAdapter
 
 import litellm
 from litellm import Router
@@ -47,6 +51,255 @@ from litellm.router import (
 from litellm.router_strategy import simple_shuffle
 from litellm.types.llms.openai import ChatCompletionRequest
 from litellm.types.router import Deployment, DeploymentTypedDict, LiteLLM_Params, ModelInfo, PreRoutingHookResponse, RetryPolicy
+
+
+class _OverflowSummary:
+    def __init__(self) -> None:
+        self.requests: tuple[list[dict[str, str]], ...] = ()
+
+    async def __call__(
+        self, model: str, messages: list[dict[str, str]], max_tokens: int, timeout: float
+    ) -> litellm.ModelResponse:
+        assert model == "overflow-summary"
+        assert 0 < timeout <= 120
+        self.requests += (messages,)
+        return litellm.ModelResponse(
+            choices=[
+                {
+                    "message": {"role": "assistant", "content": "The launch code is MARIGOLD-482"},
+                    "finish_reason": "stop",
+                }
+            ]
+        )
+
+
+def _overflow_router(pre_checks: bool) -> Router:
+    return Router(
+        model_list=[
+            {
+                "model_name": "overflow-auto",
+                "litellm_params": {
+                    "model": "auto_router/complexity_router",
+                    "complexity_router_config": {
+                        "classifier_type": "heuristic",
+                        "tiers": {
+                            "SIMPLE": "overflow-target",
+                            "MEDIUM": "overflow-target",
+                            "COMPLEX": "overflow-target",
+                            "REASONING": "overflow-target",
+                        },
+                        "context_window_compaction_model": "overflow-summary",
+                        "max_tokens_from_tier_model": False,
+                        "deployment_affinity": True,
+                    },
+                },
+            },
+            *(
+                {
+                    "model_name": "overflow-target",
+                    "litellm_params": {
+                        "model": "openai/gpt-5.6-luna",
+                        "api_key": "test-key",
+                        "api_base": f"https://{hostname}.invalid/v1",
+                    },
+                    "model_info": {"id": hostname, "max_input_tokens": 4096, "max_output_tokens": 1024},
+                }
+                for hostname in ("overflow-a", "overflow-b")
+            ),
+            {
+                "model_name": "overflow-summary",
+                "litellm_params": {"model": "openai/gpt-5.6-luna", "api_key": "test-key"},
+                "model_info": {"max_input_tokens": 64000, "max_output_tokens": 8192},
+            },
+        ],
+        enable_pre_call_checks=pre_checks,
+        num_retries=0,
+    )
+
+
+def _overflow_provider_response(request: httpx.Request) -> httpx.Response:
+    if request.url.path.endswith("/responses"):
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_compacted",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "gpt-5.6-luna",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_compacted",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "MARIGOLD-482", "annotations": []}],
+                    }
+                ],
+                "usage": {"input_tokens": 40, "output_tokens": 8, "total_tokens": 48},
+            },
+        )
+    return httpx.Response(
+        200,
+        json={
+            "id": "chatcmpl_compacted",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-5.6-luna",
+            "choices": [
+                {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "MARIGOLD-482"}}
+            ],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 8, "total_tokens": 48},
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("chat", "responses", "messages"))
+@pytest.mark.parametrize("pre_checks", (False, True))
+async def test_autorouter_overflow_compacts_before_pinned_deployment_dispatch(
+    surface: str, pre_checks: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _overflow_router(pre_checks)
+    summary: Final = _OverflowSummary()
+    history: Final = [
+        {"role": "user", "content": "The launch code is MARIGOLD-482. " + "historical record " * 5000},
+        {"role": "assistant", "content": "Recorded"},
+        {"role": "user", "content": "What is the launch code?"},
+    ]
+    original: Final = copy.deepcopy(history)
+    with respx.mock(assert_all_called=False) as transport, use_summary_executor(summary):
+        target: Final = transport.route(host__regex=r"overflow-[ab]\.invalid").mock(
+            side_effect=_overflow_provider_response
+        )
+        await router.acompletion(
+            model="overflow-auto",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=256,
+            metadata={"session_id": "compaction-pin"},
+        )
+        assert not summary.requests
+        pinned_host: Final = target.calls[0].request.url.host
+        if surface == "chat":
+            await router.acompletion(
+                model="overflow-auto", messages=history, max_tokens=256, metadata={"session_id": "compaction-pin"}
+            )
+        elif surface == "responses":
+            await router.aresponses(
+                model="overflow-auto", input=history, max_output_tokens=256, metadata={"session_id": "compaction-pin"}
+            )
+        else:
+            await router.aanthropic_messages(
+                model="overflow-auto", messages=history, max_tokens=256, metadata={"session_id": "compaction-pin"}
+            )
+        assert target.call_count == 2
+        sent: Final = target.calls[-1].request
+        assert sent.url.host == pinned_host
+        wire: Final = json.loads(sent.content)
+        field: Final = "input" if "input" in wire else "messages"
+        assert "untrusted user data" in json.dumps(wire[field])
+        assert "historical record" not in json.dumps(wire[field])
+        assert "What is the launch code?" in json.dumps(wire[field][-1])
+        assert "_context_window_compaction_state" not in wire
+        assert len(summary.requests) == 1
+        assert "historical record" in summary.requests[0][1]["content"]
+        assert history == original
+
+
+@pytest.mark.asyncio
+async def test_autorouter_overflow_without_compactable_history_does_not_attempt_target() -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    router: Final = _overflow_router(True)
+    summary: Final = _OverflowSummary()
+    with respx.mock(assert_all_called=False), use_summary_executor(summary):
+        with pytest.raises(litellm.ContextWindowExceededError):
+            await router.acompletion(
+                model="overflow-auto",
+                messages=[{"role": "user", "content": "latest request " * 5000}],
+                max_tokens=256,
+            )
+    assert not summary.requests
+    assert not router.total_calls
+
+
+@pytest.mark.asyncio
+async def test_autorouter_overflow_retry_reuses_paid_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _overflow_router(False)
+    summary: Final = _OverflowSummary()
+    history: Final = [
+        {"role": "user", "content": "old history " * 5000},
+        {"role": "assistant", "content": "Recorded"},
+        {"role": "user", "content": "What is the code?"},
+    ]
+    with respx.mock(assert_all_called=False) as transport, use_summary_executor(summary):
+        target: Final = transport.route(host__regex=r"overflow-[ab]\.invalid").mock(
+            side_effect=[
+                httpx.Response(503, json={"error": {"message": "Temporarily unavailable", "type": "server_error"}}),
+                _overflow_provider_response(httpx.Request("POST", "https://overflow-a.invalid/v1/chat/completions")),
+            ]
+        )
+        await router.acompletion(
+            model="overflow-auto",
+            messages=history,
+            max_tokens=256,
+            num_retries=1,
+            max_retries=0,
+            model_group_retry_policy={"overflow-auto": RetryPolicy(ServiceUnavailableErrorRetries=1)},
+        )
+        assert target.call_count == 2
+        assert len(summary.requests) == 1
+        assert (
+            json.loads(target.calls[0].request.content)["messages"]
+            == json.loads(target.calls[1].request.content)["messages"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_autorouter_overflow_streams_compacted_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _overflow_router(True)
+    summary: Final = _OverflowSummary()
+    history: Final = [
+        {"role": "user", "content": "old history " * 5000},
+        {"role": "assistant", "content": "Recorded"},
+        {"role": "user", "content": "What is the code?"},
+    ]
+    events: Final = (
+        {
+            "id": "chatcmpl_stream",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-5.6-luna",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "MARIGOLD-482"}, "finish_reason": None}],
+        },
+        {
+            "id": "chatcmpl_stream",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-5.6-luna",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+    )
+    with respx.mock(assert_all_called=False) as transport, use_summary_executor(summary):
+        target: Final = transport.route(host__regex=r"overflow-[ab]\.invalid").respond(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content="".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n",
+        )
+        response: Final = await router.acompletion(model="overflow-auto", messages=history, max_tokens=256, stream=True)
+        chunks: Final = [chunk async for chunk in response]
+        assert "MARIGOLD-482" in "".join(chunk.choices[0].delta.content or "" for chunk in chunks)
+        assert len(summary.requests) == 1
+        assert "untrusted user data" in target.calls[0].request.content.decode()
 
 
 def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():
@@ -16485,3 +16738,577 @@ class TestMemberAutoRouterInference:
         monkeypatch.setitem(sys.modules, "fastapi", None)
         monkeypatch.delitem(sys.modules, "litellm.proxy.auth.auto_router_checks", raising=False)
         assert (await self._route(router, {"metadata": {"user_api_key_team_id": "router-team"}})).model == "restricted-model"
+
+
+_STREAMING_OVERFLOW_HISTORY: Final = (
+    MappingProxyType({"role": "user", "content": "OLD-HISTORY-REVIEW " * 5000}),
+    MappingProxyType({"role": "assistant", "content": "Recorded"}),
+    MappingProxyType({"role": "user", "content": "What is the identifier?"}),
+)
+
+
+def _streaming_overflow_router(
+    surface: Literal["chat", "messages", "responses"],
+    backup_input_limit: int,
+    pre_checks: bool = False,
+    strategy: Literal["simple-shuffle", "usage-based-routing"] = "simple-shuffle",
+    defaults: Mapping[str, object] = MappingProxyType({}),
+    deployment_params: Mapping[str, object] = MappingProxyType({}),
+    summary_params: Mapping[str, object] = MappingProxyType({}),
+    summary_input_limit: int = 64000,
+    summary_output_limit: int = 8192,
+) -> Router:
+    provider_model: Final = "anthropic/claude-sonnet-5" if surface == "messages" else "openai/gpt-5.6-luna"
+    return Router(
+        model_list=[
+            {
+                "model_name": "streaming-overflow",
+                "litellm_params": {
+                    "model": "auto_router/complexity_router",
+                    "complexity_router_config": {
+                        "tiers": {tier: "streaming-primary" for tier in ("SIMPLE", "MEDIUM", "COMPLEX", "REASONING")},
+                        "context_window_compaction_model": "overflow-summary",
+                        "max_tokens_from_tier_model": False,
+                    },
+                },
+            },
+            *(
+                {
+                    "model_name": group,
+                    "litellm_params": {
+                        **deployment_params,
+                        "model": provider_model,
+                        "api_key": "test-key",
+                        "api_base": f"https://{group}.invalid",
+                    },
+                    "model_info": {"max_input_tokens": input_limit, "max_output_tokens": 1024},
+                }
+                for group, input_limit in (("streaming-primary", 4096), ("streaming-backup", backup_input_limit))
+            ),
+            {
+                "model_name": "overflow-summary",
+                "litellm_params": {**summary_params, "model": "openai/gpt-5.6-luna", "api_key": "test-key"},
+                "model_info": {"max_input_tokens": summary_input_limit, "max_output_tokens": summary_output_limit},
+            },
+        ],
+        routing_strategy=strategy,
+        default_litellm_params=TypeAdapter(dict[str, object]).validate_python(defaults),
+        enable_pre_call_checks=pre_checks,
+        num_retries=0,
+        fallbacks=[{"streaming-primary": ["streaming-backup"]}],
+    )
+
+
+def _overflow_stream_http_response(surface: Literal["messages", "responses"], failed: bool) -> httpx.Response:
+    event: Final = (
+        {
+            "type": "error",
+            "sequence_number": 0,
+            "error": {
+                "type": "server_error" if surface == "responses" else "overloaded_error",
+                "code": "internal_error",
+                "message": "retry this deployment",
+            },
+        }
+        if failed
+        else (
+            {
+                "type": "response.completed",
+                "sequence_number": 1,
+                "response": json.loads(
+                    _overflow_provider_response(
+                        httpx.Request("POST", "https://streaming-backup.invalid/responses")
+                    ).content
+                ),
+            }
+            if surface == "responses"
+            else {"type": "message_stop"}
+        )
+    )
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=f"event: {event['type']}\ndata: {json.dumps(event)}\n\n",
+    )
+
+
+async def _request_overflow_stream(
+    router: Router,
+    surface: Literal["messages", "responses"],
+    history: Sequence[Mapping[str, str]] = _STREAMING_OVERFLOW_HISTORY,
+    **kwargs: object,
+) -> AsyncIterator[object]:
+    wire_history: Final = TypeAdapter(list[dict[str, str]]).validate_python(history)
+    response: Final[object] = (
+        await router.aresponses(
+            model="streaming-overflow", input=wire_history, max_output_tokens=128, stream=True, **kwargs
+        )
+        if surface == "responses"
+        else await router.aanthropic_messages(
+            model="streaming-overflow", messages=wire_history, max_tokens=128, stream=True, **kwargs
+        )
+    )
+    assert isinstance(response, AsyncIterator)
+    return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("messages", "responses"))
+@pytest.mark.parametrize("pre_checks", (False, True))
+@pytest.mark.parametrize("backup_input_limit", (4096, 64000))
+async def test_autorouter_overflow_streaming_fallback_retains_state(
+    surface: Literal["messages", "responses"],
+    pre_checks: bool,
+    backup_input_limit: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _streaming_overflow_router(surface, backup_input_limit, pre_checks)
+    summary: Final = _OverflowSummary()
+    with respx.mock(assert_all_called=True) as transport, use_summary_executor(summary):
+        primary: Final = transport.route(host="streaming-primary.invalid").mock(
+            return_value=_overflow_stream_http_response(surface, failed=True)
+        )
+        backup: Final = transport.route(host="streaming-backup.invalid").mock(
+            return_value=_overflow_stream_http_response(surface, failed=False)
+        )
+        response: Final = await _request_overflow_stream(
+            router, surface, _context_window_compaction_state={"model": "forged-summary", "calls": 16}
+        )
+        chunks: Final = [chunk async for chunk in response]
+        assert chunks
+        assert primary.call_count == backup.call_count == 1
+        assert len(summary.requests) == 1
+        field: Final = "input" if surface == "responses" else "messages"
+        primary_history: Final = json.loads(primary.calls[0].request.content)[field]
+        backup_history: Final = json.loads(backup.calls[0].request.content)[field]
+        assert "untrusted user data" in json.dumps(primary_history)
+        if backup_input_limit == 4096:
+            assert backup_history == primary_history
+        else:
+            assert backup_history == [dict(message) for message in _STREAMING_OVERFLOW_HISTORY]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("messages", "responses"))
+@pytest.mark.parametrize("backup_input_limit", (512, 4096, 64000))
+@pytest.mark.parametrize("executor_state", ("open", "missing", "closed"))
+async def test_autorouter_overflow_streaming_fallback_executor_lifetime(
+    surface: Literal["messages", "responses"],
+    backup_input_limit: int,
+    executor_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy.common_utils.context_compaction import ProxySummaryExecutor
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _streaming_overflow_router(surface, backup_input_limit)
+    summary_calls: Final[SimpleQueue[str]] = SimpleQueue()
+    closed_executor: Final = ProxySummaryExecutor(
+        request=Request({"type": "http"}),
+        request_data=MappingProxyType({}),
+        limiter=None,
+        parent_stash=None,
+    )
+    closed_executor.closed.set()
+
+    async def summarize(
+        model: str, messages: Sequence[Mapping[str, str]], max_tokens: int, timeout: float
+    ) -> litellm.ModelResponse:
+        summary_calls.put(model)
+        return litellm.ModelResponse(
+            choices=[
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Historical identifier REVIEW-73. " * (160 if summary_calls.qsize() == 1 else 1),
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        )
+
+    with respx.mock(assert_all_called=False) as transport:
+        primary: Final = transport.route(host="streaming-primary.invalid").mock(
+            return_value=_overflow_stream_http_response(surface, failed=True)
+        )
+        backup: Final = transport.route(host="streaming-backup.invalid").mock(
+            return_value=_overflow_stream_http_response(surface, failed=False)
+        )
+        with use_summary_executor(summarize):
+            response: Final = await _request_overflow_stream(
+                router, surface, proxy_server_request={"url": "http://proxy.invalid", "method": "POST", "body": {}}
+            )
+        fallback_executor_scope: Final = (
+            use_summary_executor(summarize)
+            if executor_state == "open"
+            else use_summary_executor(closed_executor)
+            if executor_state == "closed"
+            else nullcontext()
+        )
+        with fallback_executor_scope:
+            if backup_input_limit == 512 and executor_state != "open":
+                with pytest.raises(openai.APIError):
+                    _ = [chunk async for chunk in response]
+                assert backup.call_count == 0
+            else:
+                chunks: Final = [chunk async for chunk in response]
+                assert chunks
+                assert backup.call_count == 1
+        assert primary.call_count == 1
+        assert summary_calls.qsize() == (2 if executor_state == "open" and backup_input_limit == 512 else 1)
+
+
+def _overflow_tool(
+    surface: Literal["chat", "messages", "responses"], name: str, description: str
+) -> Mapping[str, object]:
+    parameters: Final = {"type": "object", "properties": {}}
+    if surface == "messages":
+        return MappingProxyType({"name": name, "description": description, "input_schema": parameters})
+    if surface == "responses":
+        return MappingProxyType(
+            {"type": "function", "name": name, "description": description, "parameters": parameters}
+        )
+    return MappingProxyType(
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+            },
+        }
+    )
+
+
+async def _request_effective_overflow(
+    router: Router,
+    surface: Literal["chat", "messages", "responses"],
+    history: Sequence[Mapping[str, str]],
+    params: Mapping[str, object] = MappingProxyType({}),
+) -> object:
+    wire_history: Final = TypeAdapter(list[dict[str, str]]).validate_python(history)
+    if surface == "responses":
+        return await router.aresponses(model="streaming-overflow", input=wire_history, max_output_tokens=128, **params)
+    if surface == "messages":
+        return await router.aanthropic_messages(
+            model="streaming-overflow", messages=wire_history, max_tokens=128, **params
+        )
+    return await router.acompletion(model="streaming-overflow", messages=wire_history, max_tokens=128, **params)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "surface,field",
+    (
+        ("chat", "tools"),
+        ("responses", "tools"),
+        ("messages", "tools"),
+        ("responses", "instructions"),
+        ("messages", "system"),
+    ),
+)
+@pytest.mark.parametrize("pre_checks", (False, True))
+async def test_autorouter_overflow_counts_dispatch_defaults(
+    surface: Literal["chat", "messages", "responses"],
+    field: str,
+    pre_checks: bool,
+) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    protected: Final = "protected instruction " * 5000
+    defaults: Final = {field: [dict(_overflow_tool(surface, "lookup", protected))] if field == "tools" else protected}
+    original: Final = copy.deepcopy(defaults)
+    history: Final = ({"role": "user", "content": "Hello"},)
+    router: Final = _streaming_overflow_router(surface, 4096, pre_checks, defaults=defaults)
+    router_defaults: Final = copy.deepcopy(router.default_litellm_params)
+    summary: Final = _OverflowSummary()
+    with respx.mock(assert_all_called=False) as transport, use_summary_executor(summary):
+        target: Final = transport.route(host="streaming-primary.invalid").mock(side_effect=_overflow_provider_response)
+        with pytest.raises(litellm.ContextWindowExceededError):
+            await _request_effective_overflow(router, surface, history, {"disable_fallbacks": True})
+        assert target.call_count == 0
+        assert not summary.requests
+        assert not router.total_calls
+    assert defaults == original
+    assert router.default_litellm_params == router_defaults
+    assert history == ({"role": "user", "content": "Hello"},)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("chat", "messages", "responses"))
+@pytest.mark.parametrize("default_tools", (False, True))
+async def test_autorouter_overflow_counts_merged_deployment_tools(
+    surface: Literal["chat", "messages", "responses"],
+    default_tools: bool,
+) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    deployment: Final = {"tools": [dict(_overflow_tool(surface, "deployed", "deployment tool " * 1400))]}
+    request: Final = {"tools": [dict(_overflow_tool(surface, "requested", "request tool " * 1400))]}
+    defaults: Final = {"tools": [dict(_overflow_tool(surface, "default", "short default"))]} if default_tools else {}
+    original_deployment: Final = copy.deepcopy(deployment)
+    original_request: Final = copy.deepcopy(request)
+    router: Final = _streaming_overflow_router(surface, 4096, defaults=defaults, deployment_params=deployment)
+    summary: Final = _OverflowSummary()
+    with respx.mock(assert_all_called=False) as transport, use_summary_executor(summary):
+        target: Final = transport.route(host="streaming-primary.invalid").mock(side_effect=_overflow_provider_response)
+        with pytest.raises(litellm.ContextWindowExceededError):
+            await _request_effective_overflow(
+                router, surface, ({"role": "user", "content": "Hello"},), {**request, "disable_fallbacks": True}
+            )
+        assert target.call_count == 0
+        assert not summary.requests
+    assert request == original_request
+    assert deployment == original_deployment
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "surface,field",
+    (
+        ("chat", "tools"),
+        ("responses", "tools"),
+        ("messages", "tools"),
+        ("responses", "instructions"),
+        ("messages", "system"),
+    ),
+)
+@pytest.mark.parametrize("replacement_source", ("request", "deployment"))
+async def test_autorouter_overflow_default_precedence_preserves_fitting_requests(
+    surface: Literal["chat", "messages", "responses"],
+    field: str,
+    replacement_source: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    protected: Final = "protected instruction " * 5000
+    defaults: Final = {field: [dict(_overflow_tool(surface, "default", protected))] if field == "tools" else protected}
+    replacement: Final = {
+        field: [dict(_overflow_tool(surface, "replacement", "small tool"))]
+        if field == "tools"
+        else "small instructions"
+    }
+    router: Final = _streaming_overflow_router(
+        surface,
+        4096,
+        defaults=defaults,
+        deployment_params=replacement if replacement_source == "deployment" else MappingProxyType({}),
+    )
+    original_defaults: Final = copy.deepcopy(router.default_litellm_params)
+    original_replacement: Final = copy.deepcopy(replacement)
+    summary: Final = _OverflowSummary()
+    response: Final = (
+        httpx.Response(
+            200,
+            json={
+                "id": "msg_fit",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "fit"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 20, "output_tokens": 1},
+            },
+        )
+        if surface == "messages"
+        else _overflow_provider_response(httpx.Request("POST", f"https://streaming-primary.invalid/{surface}"))
+    )
+    with respx.mock(assert_all_called=False) as transport, use_summary_executor(summary):
+        target: Final = transport.route(host="streaming-primary.invalid").mock(return_value=response)
+        params: Final = {**(replacement if replacement_source == "request" else {}), "disable_fallbacks": True}
+        if replacement_source == "deployment" and field != "tools":
+            with pytest.raises(litellm.ContextWindowExceededError):
+                await _request_effective_overflow(router, surface, ({"role": "user", "content": "Hello"},), params)
+            assert target.call_count == 0
+        else:
+            await _request_effective_overflow(router, surface, ({"role": "user", "content": "Hello"},), params)
+            assert target.call_count == 1
+            wire: Final = json.loads(target.calls[0].request.content)
+            assert wire[field] == replacement[field]
+        assert not summary.requests
+    assert router.default_litellm_params == original_defaults
+    assert replacement == original_replacement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ("router", "deployment"))
+@pytest.mark.parametrize("field", ("tools", "system", "instructions"))
+async def test_autorouter_overflow_summary_counts_inherited_prompt_fields(
+    source: str,
+    field: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    protected: Final = "inherited summary prompt " * 220
+    inherited: Final = {
+        field: [dict(_overflow_tool("chat", "lookup", protected))] if field == "tools" else protected,
+    }
+    router: Final = _streaming_overflow_router(
+        "chat",
+        4096,
+        defaults=inherited if source == "router" else MappingProxyType({}),
+        summary_params=inherited if source == "deployment" else MappingProxyType({}),
+        summary_input_limit=512,
+        summary_output_limit=128,
+    )
+    original_defaults: Final = copy.deepcopy(router.default_litellm_params)
+    original_inherited: Final = copy.deepcopy(inherited)
+    summary: Final = _OverflowSummary()
+    with respx.mock(assert_all_called=False) as transport, use_summary_executor(summary):
+        target: Final = transport.route(host="streaming-primary.invalid").mock(side_effect=_overflow_provider_response)
+        with pytest.raises(litellm.ContextWindowExceededError):
+            await _request_effective_overflow(router, "chat", _STREAMING_OVERFLOW_HISTORY, {"disable_fallbacks": True})
+        assert not summary.requests
+        assert target.call_count == 0
+        assert not router.total_calls
+    assert router.default_litellm_params == original_defaults
+    assert inherited == original_inherited
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ("messages", "instructions", "tools", "max_tokens", "thinking", "reasoning"))
+async def test_autorouter_overflow_summary_rejects_protected_extra_body(
+    field: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    params: Final = {"extra_body": {field: "replacement"}}
+    router: Final = _streaming_overflow_router("chat", 4096, summary_params=params)
+    summary: Final = _OverflowSummary()
+    with respx.mock(assert_all_called=False) as transport, use_summary_executor(summary):
+        target: Final = transport.route(host="streaming-primary.invalid").mock(side_effect=_overflow_provider_response)
+        with pytest.raises(litellm.ContextWindowExceededError):
+            await _request_effective_overflow(router, "chat", _STREAMING_OVERFLOW_HISTORY, {"disable_fallbacks": True})
+        assert not summary.requests
+        assert target.call_count == 0
+        assert not router.total_calls
+    assert params == {"extra_body": {field: "replacement"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("chat", "messages", "responses"))
+async def test_autorouter_overflow_rejects_legacy_selector_explicitly(
+    surface: Literal["chat", "messages", "responses"],
+) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    router: Final = _streaming_overflow_router(surface, 4096, strategy="usage-based-routing")
+    summary: Final = _OverflowSummary()
+    with respx.mock(assert_all_called=False) as transport, use_summary_executor(summary):
+        with pytest.raises(litellm.ContextWindowExceededError, match="legacy synchronous deployment selection"):
+            await _request_effective_overflow(
+                router, surface, ({"role": "user", "content": "Hello"},), {"disable_fallbacks": True}
+            )
+        assert not transport.calls
+        assert not summary.requests
+        assert not router.total_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_overflows", (False, True))
+async def test_autorouter_overflow_explicit_chat_history_beats_default_history(
+    request_overflows: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    small: Final = ({"role": "user", "content": "Hello"},)
+    default_history: Final = small if request_overflows else _STREAMING_OVERFLOW_HISTORY
+    request_history: Final = _STREAMING_OVERFLOW_HISTORY if request_overflows else small
+    router: Final = _streaming_overflow_router(
+        "chat",
+        4096,
+        defaults={
+            "messages": TypeAdapter(list[dict[str, str]]).validate_python(default_history),
+        },
+    )
+    original_defaults: Final = copy.deepcopy(router.default_litellm_params)
+    summary: Final = _OverflowSummary()
+    with respx.mock(assert_all_called=True) as transport, use_summary_executor(summary):
+        target: Final = transport.route(host="streaming-primary.invalid").mock(side_effect=_overflow_provider_response)
+        await _request_effective_overflow(router, "chat", request_history)
+        assert target.call_count == 1
+        wire_history: Final = json.loads(target.calls[0].request.content)["messages"]
+        if request_overflows:
+            assert "untrusted user data" in json.dumps(wire_history)
+            assert len(summary.requests) == 1
+        else:
+            assert wire_history == list(small)
+            assert not summary.requests
+    assert router.default_litellm_params == original_defaults
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ("max_completion_tokens", "max_output_tokens"))
+@pytest.mark.parametrize("matches_summary_budget", (False, True))
+@pytest.mark.parametrize("overflow", (False, True))
+async def test_autorouter_overflow_summary_output_defaults_match_explicit_budget(
+    field: str, matches_summary_budget: bool, overflow: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.router_strategy.complexity_router.context_compaction import use_summary_executor
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = _streaming_overflow_router(
+        "chat", 4096, summary_params={field: 128 if matches_summary_budget else 64}, summary_output_limit=128,
+    )
+    summary: Final = _OverflowSummary()
+    history: Final = _STREAMING_OVERFLOW_HISTORY if overflow else ({"role": "user", "content": "Hello"},)
+    with respx.mock(assert_all_called=False) as transport, use_summary_executor(summary):
+        target: Final = transport.route(host="streaming-primary.invalid").mock(side_effect=_overflow_provider_response)
+        if overflow and not matches_summary_budget:
+            with pytest.raises(litellm.ContextWindowExceededError, match="summary output-token budget"):
+                await _request_effective_overflow(router, "chat", history, {"disable_fallbacks": True})
+            assert target.call_count == 0
+            assert not summary.requests
+        else:
+            await _request_effective_overflow(router, "chat", history, {"disable_fallbacks": True})
+            assert target.call_count == 1
+            assert len(summary.requests) == int(overflow)
+
+
+@pytest.mark.asyncio
+async def test_autorouter_overflow_summary_chunks_fit_actual_sdk_tool_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    default_tools: Final = [dict(_overflow_tool("chat", "default", "unused large default " * 5000))]
+    summary_tools: Final = [dict(_overflow_tool("chat", "summary", "inherited summary tool " * 120))]
+    request_tools: Final = [dict(_overflow_tool("chat", "request", "small request tool"))]
+    router: Final = _streaming_overflow_router(
+        "chat", 4096, defaults={"tools": default_tools},
+        summary_params={"tools": summary_tools, "api_base": "https://streaming-summary.invalid"},
+        summary_input_limit=2048, summary_output_limit=128,
+    )
+    original_defaults: Final = copy.deepcopy(router.default_litellm_params)
+    original_summary_tools: Final = copy.deepcopy(summary_tools)
+    original_request_tools: Final = copy.deepcopy(request_tools)
+    history: Final = (
+        {"role": "user", "content": "historical record " * 2400},
+        {"role": "assistant", "content": "Recorded"},
+        {"role": "user", "content": "What is the code?"},
+    )
+    with respx.mock(assert_all_called=True) as transport:
+        summaries: Final = transport.route(host="streaming-summary.invalid").mock(
+            side_effect=_overflow_provider_response
+        )
+        target: Final = transport.route(host="streaming-primary.invalid").mock(side_effect=_overflow_provider_response)
+        await _request_effective_overflow(router, "chat", history, {"tools": request_tools, "disable_fallbacks": True})
+        assert 1 < summaries.call_count <= 16
+        assert target.call_count == 1
+        for call in summaries.calls:
+            payload: Final = TypeAdapter(dict[str, object]).validate_json(call.request.content)
+            assert payload["tools"] == summary_tools
+            assert await router._acount_compaction_tokens("openai/gpt-5.6-luna", payload) <= 2048 - 128 - 64
+        assert json.loads(target.calls[0].request.content)["tools"] == request_tools
+    assert router.default_litellm_params == original_defaults
+    assert summary_tools == original_summary_tools
+    assert request_tools == original_request_tools
